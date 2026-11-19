@@ -412,3 +412,39 @@ def test_model_ema_v3_device_move(device, foreach):
         ema.update(model, step=10)
         assert ema.module.weight.device.type == device
     torch.testing.assert_close(meta_ema.module.weight, cpu_ema.module.weight, rtol=0, atol=0)
+
+
+def test_model_ema_v3_meta_device_arg():
+    """An EMA of a meta model with an explicit device= is materialized on that device, then set & updated."""
+    from timm.utils.model_ema import ModelEmaV3
+    with torch.device('meta'):
+        ema = ModelEmaV3(torch.nn.Linear(16, 16, dtype=torch.bfloat16), decay=0.9998, device='cpu')
+    assert ema.module.weight.device.type == 'cpu'
+    model = torch.nn.Linear(16, 16).to(torch.bfloat16)
+    ema.set(model)
+    ema.update(model, step=10)
+    torch.testing.assert_close(ema.module.weight, model.weight, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('foreach', [True, False])
+def test_model_ema_v3_multi_device(foreach):
+    """Device placement is resolved per update: 'cuda' matches the model on 'cuda:0' (foreach kept), and a model
+    spanning devices updates per device, including bfloat16 stochastic rounding."""
+    from timm.utils.model_ema import ModelEmaV3
+    model = torch.nn.Linear(16, 16).cuda()
+    assert ModelEmaV3(model, device='cuda').foreach
+
+    model = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Linear(64, 64).cuda()).to(torch.bfloat16)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.fill_(1.)
+    ema = ModelEmaV3(model, decay=0.9998, foreach=foreach)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.fill_(2.)
+    for step in range(10, 20):
+        ema.update(model, step=step)
+    for ema_p, model_p in zip(ema.module.parameters(), model.parameters()):
+        assert ema_p.device == model_p.device
+        assert ema_p.float().mean().item() > 1.  # sub-resolution updates accumulate via stochastic rounding
